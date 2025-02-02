@@ -1,0 +1,14 @@
+<configuration>
+	<input>
+		<net-file value="grid.net.xml"/>
+		<route-files value="trips.rou.xml"/>
+		<additional-files value="parking_areas.add.xml,parking_rerouters.add.xml,detectors.add.xml"/>
+	</input>
+	<time>
+		<begin value="0" />
+		<end value="14400" />
+	</time>
+	<processing>
+		<random-depart-offset value="300" />
+	</processing>
+</configuration>
