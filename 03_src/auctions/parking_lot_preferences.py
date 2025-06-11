@@ -45,3 +45,22 @@ class BalancedCostDistancePreference(MinDistancePreference):
                 best_auc_id = ac
             
         return best_auc_id
+    
+class WeighedCostDistancePreference(MinDistancePreference):
+    """Computes preferences based on beta*cost+(1-beta)*distance function.
+       That results in prefering closer and cheaper parking against the more expensive and more distant ones.
+       (Values gets normalized during calculation.)"""
+    def __call__(self, buyer_id, auction_ids, bids):
+        max_dist = max(list(self.distance_mtx[buyer_id].values()))
+        max_bid = max(list(bids.values()))
+        best_val = 10000
+        best_auc_id = None
+        
+        for ac in bids:
+            edge = ac.split("_")[1]
+            pref_fn = bids[ac]/max_bid + self.distance_mtx[buyer_id][edge]/max_dist
+            if pref_fn < best_val:
+                best_val = pref_fn
+                best_auc_id = ac
+            
+        return best_auc_id

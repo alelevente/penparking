@@ -163,3 +163,5 @@ cython_debug/
 
 02_data/*/*
 **.out.xml
+01_simulation/02_scenario/*
+02_data/*.json
