@@ -1,11 +1,17 @@
 #!/bin/bash
 
 seeds=(42 1812 9698 424 820 75 98 65535 16383 513)
-pens=(1 2 3 4 5 6 7 8 9)
+mixes=("mix10" "mix25" "mix50")
+penetrations=(2 4 6 8 10)
 
-for p in ${pens[@]}; do
-    for s in ${seeds[@]}; do
-        python3 auction_measurement.py $s --name pen$p:$s --penetration $p &
+for m in ${mixes[@]}; do
+    python3 ./generate_demand.py probs.dst.xml
+    ./generate.sh
+    
+    for p in ${penetrations[@]}; do
+        for s in ${seeds[@]}; do
+            python3 auction_measurement.py $s --name $m/auction$p/$s --penetration $p --mix_config ../01_simulation/02_scenario/configurations/$m.json &
+        done
+        wait
     done
-    wait
 done

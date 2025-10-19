@@ -39,7 +39,7 @@ def get_inverse_edge(edge_id):
     return edge_dict[(to_e, from_e)]
 
 if __name__ == "__main__":
-    net = sumolib.net.readNet("../02_scenario/grid.net.xml")
+    net = sumolib.net.readNet("../01_simulation/02_scenario/grid.net.xml")
     
     edge_dict = {}
     for e in net.getEdges():
@@ -47,7 +47,7 @@ if __name__ == "__main__":
         to_e = e.getToNode().getID()
         edge_dict[(from_e, to_e)] = e.getID()
         
-    trips_tree = ET.parse("../02_scenario/trips.trips.xml")
+    trips_tree = ET.parse("../01_simulation/02_scenario/trips.trips.xml")
 
     for trip_e in trips_tree.findall("trip"):
         new_destination = get_inverse_edge(trip_e.get("from"))
@@ -56,5 +56,5 @@ if __name__ == "__main__":
         new_stop.set("parkingArea", f"pa{park_at}")
         new_stop.set("duration", str(int(np.random.uniform(15*60, 45*60))))
         
-    with open("../02_scenario/trips_with_stops.trips.xml", "wb") as f:
+    with open("../01_simulation/02_scenario/trips_with_stops.trips.xml", "wb") as f:
         trips_tree.write(f)

@@ -7,14 +7,15 @@ import argparse
 import sys
 import os
 import json
+import re
 
 sys.path.append("auctions")
 import helper
-from parking_lot_preferences import BalancedCostDistancePreference
+import auction
 
 SIM_ROOT = "../01_simulation/02_scenario/"
 SIMULATION = "../01_simulation/02_scenario/sim.sumocfg"
-SUMO_CMD = ["sumo", "-c", SIMULATION, "--no-step-log", "--tripinfo-output", "vehicle_trips.xml"]
+SUMO_CMD = ["sumo", "-c", SIMULATION, "--no-step-log"]
 TIME_STEP = 15
 PARKING_DEFS = "../01_simulation/02_scenario/parking_areas.add.xml"
 STARTING_PRICE_DEF = "../02_data/starting_prices.json"
@@ -33,18 +34,6 @@ def calc_free_parkings(free_parkings, reservations):
         free_parkings[res] = max(0, free_parkings[res] - reservations[res])
     return free_parkings
 
-def randomize_free_parking_nums(free_parkings, mse):
-    def _distort_with_mse(x_nominal, mse):
-        ee = np.random.randint(0, 2*mse+1)
-        e = np.random.choice(a=[-1, 1], size=1)[0] * np.sqrt(ee)
-        distorted = x_nominal + e
-        return int(distorted)
-    
-    distorted_parking_nums = {}
-    for fp in free_parkings:
-        distorted_parking_nums[fp] = _distort_with_mse(free_parkings[fp], mse)
-    return distorted_parking_nums
-
 def calculate_route_distance(vehicle):
     route = traci.vehicle.getRoute(vehicle)
     dep_pos = traci.vehicle.getLanePosition(vehicle)
@@ -60,28 +49,31 @@ def calculate_route_distance(vehicle):
     return distance
 
 def make_auctions(free_parkings: dict, veh_destinations: dict, parking_distance_map: dict,
-                  starting_prices: dict, parking_edges: list, mse=0):
-    p_mtx = create_parking_mtx(veh_destinations, parking_distance_map, parking_edges)
-    #for evaluating measurement uncertainty:
-    if mse > 0:
-        free_parkings = randomize_free_parking_nums(free_parkings, mse)
-    fp = []
-    for p in parking_edges:
-        fp.append(free_parkings[f"pa{p}"])
+                  starting_prices: dict, parking_edges: list, beta_values, beta_probabilities):
     
-    pref_func = BalancedCostDistancePreference(p_mtx, fp)
-    
-    auctions, buyers = helper.init_auction_method(free_parkings, veh_destinations, starting_prices, pref_func)
-    auction_results = helper.run_auctions(auctions, buyers, verbose=False)
+    p_mtx = create_parking_mtx(veh_destinations, parking_distance_map, parking_edges)        
+    betas_ = np.random.choice(beta_values, size=len(veh_destinations), p=beta_probabilities)
+    beta_per_vehicle = {}
+    for i, bi in enumerate(veh_destinations):
+        beta_per_vehicle[bi] = betas_[i]
+        
+    fp_ = {}
+    for pa in free_parkings:
+        fp_[pa.split("pa")[-1]] = free_parkings[pa]
+        
+    auctions, buyers = auction.init_auction_method(fp_, veh_destinations, starting_prices,
+                                                   p_mtx, betas=beta_per_vehicle)
+    if len(buyers)>0:
+        print(f"{len(auctions)} auctions started with {len(buyers)} buyers")
+    auction_results = auction.run_auctions(auctions, buyers, r_max=100)
     return auction_results
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("seed", help="seed", type=str)
     parser.add_argument("--penetration", help="penetration level", type=int, default=10)
-    parser.add_argument("--uncertainty", help="measurement MSE uncertainty", type=int, default=0)
     parser.add_argument("--name", help="name of the simulation", type=str)
+    parser.add_argument("--mix_config", help="path to mix configuration", type=str)
     
     args = parser.parse_args()
     seed = args.seed
@@ -89,8 +81,19 @@ if __name__ == "__main__":
     parking_df = pd.read_xml(PARKING_DEFS, xpath="parkingArea").set_index("id")
     with open(STARTING_PRICE_DEF) as f:
         starting_prices = json.load(f)
-    
-    sumo_cmd = SUMO_CMD + ["--seed", seed, "--output-prefix", args.name]
+        
+    if not os.path.exists(f"../02_data/{args.name}"):
+        os.makedirs(f"../02_data/{args.name}")
+        
+    sim_name = args.name.split("/")[-1]
+    sumo_cmd = SUMO_CMD + ["--seed", seed, "--output-prefix",
+                           f"{sim_name}",
+                           "--tripinfo-output", f"vehicle_trips.xml"]
+    mix_config = None
+    if args.mix_config is not None:
+        with open(args.mix_config) as f:
+            mix_config = json.load(f)
+            
     traci.start(sumo_cmd)
     
     #initialization:
@@ -139,42 +142,67 @@ if __name__ == "__main__":
             for veh in to_auction:
                 dests[veh] = vehicle_data[veh]["original_position"]
             free_parkings = calc_free_parkings(free_parkings, reservations)
-            auction_result = make_auctions(free_parkings, dests, parking_distance_map,
-                                           starting_prices.copy(), parking_edges,
-                                           args.uncertainty)
-            for ar in auction_result:
-                controlled_vehicles.add(ar["buyer_id"])
-                new_dest = ar["auction_id"].split("_")[1]
-                auction_outcomes[ar["buyer_id"]] = {
-                    "parking_edge": new_dest,
-                    "price": ar["price"]
-                }
-                vehicle_data[ar["buyer_id"]]["controlled"] = True
-                #flag 65: parking @ a parking area
-                try:
-                    next_stop = traci.vehicle.getStops(ar["buyer_id"])[0]
-                    traci.vehicle.replaceStop(ar["buyer_id"], 0, f"pa{new_dest}", flags=65, duration=next_stop.duration)
-                    reservations[f"pa{new_dest}"] += 1
-                except:
-                    controlled_vehicles.remove(ar["buyer_id"])
+            
+            if len(dests)>0:
+                auction_result = make_auctions(free_parkings, dests, parking_distance_map,
+                                               starting_prices.copy(), parking_edges,
+                                               mix_config["values"],
+                                               mix_config["probabilities"])
+                
+                for ar in auction_result:
+                    veh = auction_result[ar]["winner"]
+                    if veh!="":
+                        print(ar, auction_result[ar])
+                        controlled_vehicles.add(veh)
+                        #print(controlled_vehicles)
+                        new_dest = re.sub("_[0-9]*$", "", ar)
+                        auction_outcomes[veh] = {
+                            "parking_edge": new_dest,
+                            "auction_id": ar,
+                            "price": auction_result[ar]["price"],
+                            "vehicle": veh,
+                            "distance": traci.simulation.getDistanceRoad(
+                                                            dests[veh], 0,
+                                                            new_dest.split("pa")[-1], 0, True),
+                            "time": time
+                        }
+                        vehicle_data[veh]["controlled"] = True
+                        #flag 65: parking @ a parking area
+                        try:
+                            next_stop = traci.vehicle.getStops(veh, 1)[0]
+                            traci.vehicle.replaceStop(veh, 0, f"pa{new_dest}", flags=65, duration=next_stop.duration)
+                            reservations[f"pa{new_dest}"] += 1
+                        except Exception as e:
+                            print(e)
+                            if auction_result[ar]["winner"] != "":
+                                controlled_vehicles.remove(auction_result[ar]["winner"])
             to_auction = set()
 
         #departing vehicles:
         departed_vehicles = traci.simulation.getDepartedIDList()
         for dpv in departed_vehicles:
-            vehicle_data[dpv] = {
-                "original_position": traci.vehicle.getNextStops(dpv)[0][0].split("_")[0],
-                "original_distance": calculate_route_distance(dpv),
-                "controlled": False,
-                "occupied_reserved": False
-            }
+            next_stop = traci.vehicle.getStops(dpv)
+            if len(next_stop)>0: #not through vehicle
+                pos = next_stop[0].stoppingPlaceID.split("pa")[-1]
+                vehicle_data[dpv] = {
+                    "original_position": pos,
+                    "controlled": False,
+                    "occupied_reserved": False
+                }
             r_int = np.random.randint(0, 10)
             if r_int<args.penetration:
                 to_auction.add(dpv)
             active_vehicles.add(dpv)
+            
+        #parkEndingVehicles:
+        park_ends = traci.simulation.getParkingEndingVehiclesIDList()
 
         #stopping vehicles:
         stopping_vehicles = traci.simulation.getStopStartingVehiclesIDList()
+        #if len(stopping_vehicles)>0:
+        #    print("stopping", stopping_vehicles)
+        #if len(controlled_vehicles)>0:
+        #    print("controlled", controlled_vehicles)
         for spv in stopping_vehicles:
             stop_stat = traci.vehicle.getNextStops(spv)[0]
             parking_edge = stop_stat[0].split("_")[0]
@@ -189,6 +217,7 @@ if __name__ == "__main__":
                 reserved_edge = auction_outcomes[spv]["parking_edge"]
                 reservations[f"pa{reserved_edge}"] -= 1
                 vehicle_data[spv]["auction_price"] = auction_outcomes[spv]["price"]
+                #print(reserved_edge, parking_edge)
                 if reserved_edge == parking_edge:
                     vehicle_data[spv]["paid_price"] = auction_outcomes[spv]["price"] #if controlled and successfully reserved
                     vehicle_data[spv]["occupied_reserved"] = True
@@ -204,15 +233,16 @@ if __name__ == "__main__":
     occupancy_results["occupancy"] = p_occups
     
     try:
-        if not os.path.exists(f"../02_data/{args.name}"):
-            os.mkdir(f"../02_data/{args.name}")
-        os.replace(f"{SIM_ROOT}/{args.name}detector_data.out.xml",
+        
+        os.replace(f"{SIM_ROOT}/{sim_name}detector_data.out.xml",
                    f"../02_data/{args.name}/detector_data.out.xml")
-        os.replace(f"./{args.name}vehicle_trips.xml",
+        os.replace(f"./{sim_name}vehicle_trips.xml",
                    f"../02_data/{args.name}/vehicle_trips.xml")
         
         with open(f"../02_data/{args.name}/veh_results.json", "w") as f:
             json.dump(vehicle_data, f)
+        with open(f"../02_data/{args.name}/auction_results.json", "w") as f:
+            json.dump(auction_outcomes, f)
             
         occupancy_results.to_csv(f"../02_data/{args.name}/occupancy.csv", index=False)
     except Exception as e:

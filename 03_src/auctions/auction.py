@@ -1,151 +1,181 @@
 import numpy as np
 
+import random
+import re
+
+from multiprocessing import Lock, Pool, Manager
+
 
 ############################################
 # Buyer implementation:
 class Buyer:
-    def __init__(self, auctions, max_bid, pref_function, buyer_id):
-        self.auctions = auctions[:]
-        self.max_bid = max_bid
-        self.act_bids = {}
-        self.preference = 0
-        self.pref_function = pref_function
-        self.auction_won = False
-        self.overbid = True
+    def __init__(self, buyer_id, distances, pv=1000, beta=0.5, pvmax=1000):
         self.id = buyer_id
-        self.auction_ids = []
-        for auc in self.auctions:
-            self.auction_ids.append(auc.id)
-            self.act_bids[auc.id] = auc.starting_price
+        self.state = "overbid"
+        self.pv = pv
+        self.beta = beta
+        self.pvmax = pvmax
+        self.distances = distances
+        self.prices = {}
         
-    def ask_bid(self, auction, current_bid):
-        if (current_bid > self.max_bid) or (self.auction_won):
-            return False
+    def inform_price(self, auction_id, price):
+        self.prices[auction_id] = price if price <= self.pv else np.inf
+        if np.all(np.array(self.prices) == np.inf):
+            self.state = "out_of_budget"
         
-        #collecting current bids:
-        self.act_bids[auction.id] = current_bid 
-        if self.overbid:
-            #calculating preferences:
-            current_preference = self.pref_function(self.id, self.auction_ids, self.act_bids)
-            self.overbid = current_preference != auction.id #buyer is not overbid when he accepts the bid
-            return current_preference == auction.id
+    def compute_costs(self):
+        prices, distances, id_list = [], [], []
+        for p in self.prices:
+            prices.append(self.prices[p])
+            pname = re.sub("_[0-9]*$", "", p)
+            if "garage" in pname:
+                edge = pname.split("_")[1]
+            else:
+                edge = pname.split("pa")[-1]
+            distances.append(self.distances[edge])
+            id_list.append(p)
+        prices = np.array(prices)
+        distances = np.array(distances)
+        cost = self.beta*prices/self.pvmax + (1-self.beta)*distances/np.max(distances)
+        return cost, id_list
         
-    def tell_overbid(self, auction):
-        self.overbid = True
+    def ask_bid(self, auction_id, price):
+        bids = False
+        pref_ids = []
+        if (self.state == "overbid") and (price <= self.pv):
+            costs, ids = self.compute_costs()
+            prefs = np.where(costs == costs.min())[0]
+            for p in prefs:
+                pref_ids.append(ids[p])
+            bids = auction_id in pref_ids
+        #if self.id == "carIn967:4":
+        #        print(bids, pref_ids, auction_id)
+        elif price > self.pv:
+            self.prices[auction_id] = np.inf
+        if bids:
+            self.state = "winning"
+        return bids
     
-    def tell_won(self, auction):
-        self.auction_won = True
+    def tell_overbid(self):
+        self.state = "overbid"
+        
+    def tell_won(self):
+        self.state = "won"
     
 #############################################
 # Auctioneer implementation:
-class Auctioneer:
-    def __init__(self, starting_price, bid_step, auction_id, max_rounds = 15):
-        self.starting_price = starting_price
-        self.current_price = starting_price
-        self.bid_step = bid_step
+class Auction:
+    def __init__(self, id_, starting_price, epsilon=1.0):
+        self.id = id_
+        self.price = starting_price
         self.buyers = []
+        self.epsilon = epsilon
         self.winner = None
-        self.no_winner = 0
-        self.status = "running" #status of the auction
-        self.id = auction_id
-        self.max_rounds = max_rounds
         
     def add_buyer(self, buyer):
         self.buyers.append(buyer)
         
-    def make_auction_round(self):
-        if self.status != "running": return
-        #check if buyers want to bid at the current price:
-        was_winner = False
-        for buyer in self.buyers:
-            if (buyer!=self.winner) and (buyer.ask_bid(self, self.current_price)):
-                #buyer is willing to give the current bid
-                if not(self.winner is None):
-                    self.winner.tell_overbid(self) #telling previous winner that he is no longer winning
-                self.current_price += self.bid_step #price increased
-                self.winner = buyer #setting current winner
-                self.no_winner = 0 #bid received
-                was_winner = True
+    def _inform_buyers(self):
+        for b in self.buyers:
+            b.inform_price(self.id, self.price)
         
-        if not(was_winner):
-            self.no_winner += 1
-        
-        if self.no_winner >= self.max_rounds:
-            #Going once, going twice, then its gone!
-            if not(self.winner is None):
-                self.status = "won"
-                self.winner.tell_won(self)
-            else:
-                self.status = "terminated"
+    def auction_round(self):
+        bid_received = False
+        for b in self.buyers:                
+            bids = b.ask_bid(self.id, self.price)
+            if bids:
+                if self.winner is not None:
+                    self.winner.tell_overbid()
+                self.winner = b
+                self.price += self.epsilon
+                self._inform_buyers()
+                bid_received = True
+        return bid_received
+                
+    def terminate(self):
+        winner_id = ""
+        if self.winner is not None:
+            self.winner.tell_won()
+            winner_id = self.winner.id
+        return {"winner": winner_id,
+                "price" : self.price-self.epsilon}
                 
                 
 #############################################
 # Running auctions:
 
-def _check_run_conditions(auctions, buyers):
-    """Checks whether the auctions shall run one more round."""
-    #if len(auctions)<=len(buyers):
-    num_running = 0
-    num_not_winning = 0
-    for auction in auctions:
-        if auction.status == "running": num_running += 1
-    for buyer in buyers:
-        if not(buyer.auction_won): num_not_winning += 1
-    return (num_running > 0) and (num_not_winning > 0)
+def check_terminable(buyers):
+    non_terminated_buyers = 0
+    for b in buyers:
+        if not((b.state == "winning") or (b.state == "out_of_budget")):
+            non_terminated_buyers += 1
+    return len(buyers) - non_terminated_buyers
     
     
-def run_auctions(auctions, buyers, run_to_completeness=True, verbose=False):
-    if verbose:
-        print(f"{len(auctions)} auctions initialized with {len(buyers)} buyers.")
-        
-    #initializing auctions:
-    for buyer in buyers:
-        for auction in auctions:
-            auction.add_buyer(buyer)
+def run_auctions(auctions, buyers, r_max):
+    auction_results = {}
+    rs = np.zeros(len(auctions))
+    
+    terminables = 0
+
+    while (terminables != len(buyers)): # np.sum(rs<r_max) :
+        #print(f"auction round: {terminables}/{len(buyers)}")
+        i = 0
+        while (len(buyers) != terminables) and (i<len(auctions)):
+            bid_received = auctions[i].auction_round()
+            if bid_received:
+                rs[i] = 0
+            else:
+                rs[i] += 1
+
+            terminables = check_terminable(buyers)
+            i += 1
+                
+    for a in auctions:
+        auction_results[a.id] = a.terminate()  
+    return auction_results
+
+
+def get_won_auctions(auction_results, buyers):
+    won_auctions = {}
+    for b in buyers:
+        for a in auction_results:
+            if auction_results[a]["winner"] == b.id:
+                won_auctions[b.id] = a
+    return won_auctions
+
+def init_auction_method(parking_capacities, vehicle_ids, starting_prices, parking_mtx, betas=None, bid_step = 0.05, max_price = 5)-> (list, list):
+    """Initializes the participants of the auction method
+       -------------
+       parameters:
+           - parking_capacities: capacity values of the parking lots (number of auctions),
+           - vehicle_ids: IDs of vehicles (buyers),
+           - starting_prices: dict of starting prices of the auctions,
+           - parking_mtx: mtx of parking distances for each vehicle
+           - betas: either a dict of vehicle_ids, betas, a float, or None. Default: 0.1
+           - bid_step: amount of money by which current bids will be increased during auctions,
+           - max_price: maximum price that the buyers are willing to accept"""
+    
+    auctions = []
+    buyers = []
+    if betas is None:
+        betas = 0.1
+    if type(betas) is float:
+        betas_ = {}
+        for b_i in vehicle_ids:
+            betas_[b_i] = betas
+    else:
+        betas_ = betas
             
-    #running auctions:
-    while _check_run_conditions(auctions, buyers):
-        for auction in auctions:
-            auction.make_auction_round()
+    for i, b_i in enumerate(vehicle_ids):
+        buyers.append(Buyer(b_i, parking_mtx[b_i], beta = betas_[b_i], pv=max_price, pvmax=max_price))
+    for a in parking_capacities:
+        for i in range(parking_capacities[a]):
+            auctions.append(Auction(f"{a}_{i}", starting_prices[a], bid_step))
+    random.shuffle(auctions)
+    for a in auctions:
+        for b in buyers:
+            a.add_buyer(b)
+            b.inform_price(a.id, a.price)
             
-    #collecting results:
-    auctions_won = []
-    auctions_terminated = []
-    for auction in auctions:
-        if auction.status == "won":
-            auctions_won.append(
-                {"auction_id": auction.id,
-                 "buyer_id": auction.winner.id,
-                 "price": auction.current_price-auction.bid_step})
-        else:
-            auctions_terminated.append(auction)
-    
-    if verbose:
-        print("%d out of %d auctions are won"%(len(auctions_won), len(auctions)))
-    if not(run_to_completeness): return auctions_won
-    #when running to completeness:
-    buyer_map = []
-    for i in range(len(buyers)):
-        if not(buyers[i].auction_won):
-            buyer_map.append(i)
-               
-    #initializing new participants:
-    new_auctions, new_buyers = [], [] #lists of new participants
-    auction_map = [] # mapping new indices to the original ones
-    
-    #creating new auctions:
-    for auction in auctions_terminated:
-        new_auction = Auctioneer(auction.starting_price, auction.bid_step, auction.id)
-        new_auctions.append(new_auction)
-        auction_map.append(auctions.index(auction))
-    #creating new buyers:
-    for i in buyer_map:
-        new_buyer = Buyer(new_auctions, buyers[i].max_bid, buyers[i].pref_function, buyers[i].id)
-        new_buyers.append(new_buyer)
-    if (len(new_auctions) > 0) and (len(new_buyers) > 0):
-        new_run_results = run_auctions(new_auctions, new_buyers, run_to_completeness)
-        
-        #mapping back to original indices:
-        for result in new_run_results:
-            auctions_won.append(result)
-    return auctions_won
+    return auctions, buyers

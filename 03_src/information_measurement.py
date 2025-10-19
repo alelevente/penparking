@@ -10,7 +10,7 @@ import json
 
 SIM_ROOT = "../01_simulation/02_scenario/"
 SIMULATION = "../01_simulation/02_scenario/sim.sumocfg"
-SUMO_CMD = ["sumo", "-c", SIMULATION, "--no-step-log", "--tripinfo-output", "vehicle_trips.xml"]
+SUMO_CMD = ["sumo", "-c", SIMULATION, "--no-step-log"]
 TIME_STEP = 15
 PARKING_DEFS = "../01_simulation/02_scenario/parking_areas.add.xml"
 STARTING_PRICE_DEF = "../02_data/starting_prices.json"
@@ -44,34 +44,72 @@ def calculate_route_distance(vehicle):
     distance += arr_pos
     return distance
 
-def compute_best_parkings(destinations, num_free_spaces, parking_distance_map):
+def compute_best_parkings(destinations, num_free_spaces, parking_distance_map, betas, prices):
     results = []
+    max_price = np.max(list(prices.values()))
     for veh in destinations:        
-        distance_series = pd.Series(parking_distance_map[destinations[veh]])
-        distance_series = distance_series.sort_values()
+        max_distance = np.max(list(parking_distance_map[destinations[veh]].values()))
+        distance_series, price_series = [], []
+        edge_names = []
+        for edge in prices:
+            price_series.append(prices[edge])
+            distance_series.append(parking_distance_map[destinations[veh]][edge])
+            edge_names.append(edge)
+        distance_series = np.array(distance_series)
+        price_series = np.array(price_series)
+        
+        pref_series = pd.Series(
+            data = betas[veh]*price_series/max_price + (1-betas[veh])*distance_series/max_distance,
+            index = edge_names
+        )        
+        pref_series = pref_series.sort_values()
+        #print(pref_series)
+            
         i = 0
-        while (num_free_spaces[f"pa{distance_series.keys()[i]}"] == 0) and (i < len(distance_series)):
+        pref_parkings = []
+        #print(num_free_spaces)
+        while pref_series.iloc[i] == np.min(pref_series):
+            if num_free_spaces[f"pa{pref_series.index[i]}"] > 0:
+                pref_parkings.append(pref_series.index[i])
             i += 1
+        if len(pref_parkings) == 0:
+            while num_free_spaces[f"pa{pref_series.index[i]}"] == 0:
+                i += 1
+            pref_parkings.append(pref_series.index[i])
+        #print(pref_parkings)
         results.append({"veh_id": veh,
-                        "new_parking_edge": distance_series.keys()[i]})
+                        "new_parking_edge": np.random.choice(pref_parkings)})
     return results
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("seed", help="seed", type=str)
+    parser.add_argument("mix_config", help="path to mixing configuration", type=str)
+    parser.add_argument("penetration", type=int)
     parser.add_argument("--name", help="name of the simulation", type=str)
     
     args = parser.parse_args()
     seed = args.seed
     
+    if not os.path.exists(f"../02_data/{args.name}"):
+        os.makedirs(f"../02_data/{args.name}")
+    
     parking_df = pd.read_xml(PARKING_DEFS, xpath="parkingArea")
     parking_df["id"] = parking_df["id"].astype(str)
     parking_df = parking_df.set_index("id")
+    starting_prices = {}
     with open(STARTING_PRICE_DEF) as f:
-        starting_prices = json.load(f)
+        sp = json.load(f)
+        for edge in sp:
+            starting_prices[f"pa{edge}"] = sp[edge]
+    with open(args.mix_config) as f:
+        mix_config = json.load(f)
     
-    sumo_cmd = SUMO_CMD + ["--seed", seed, "--output-prefix", args.name]
+    sim_name = args.name.split("/")[-1]
+    sumo_cmd = SUMO_CMD + ["--seed", seed, "--output-prefix",
+                           f"{sim_name}",
+                           "--tripinfo-output", f"vehicle_trips.xml"]
     traci.start(sumo_cmd)
     
     #initialization:
@@ -91,6 +129,7 @@ if __name__ == "__main__":
     to_auction = set()
     active_vehicles = set()
     vehicle_data = {}
+    betas = {}
 
     auction_outcomes = {}
     free_parkings = {}
@@ -119,9 +158,13 @@ if __name__ == "__main__":
             #parking guidance:
             dests = {}
             for veh in to_auction:
-                dests[veh] = vehicle_data[veh]["original_position"]
+                if np.random.randint(10) < args.penetration:
+                    dests[veh] = vehicle_data[veh]["original_position"]
+                    betas[veh] = np.random.choice(mix_config["values"], 1, p=mix_config["probabilities"])[0]
             free_parkings = calc_free_parkings(free_parkings, reservations)
-            guidance_result = compute_best_parkings(dests, free_parkings, parking_distance_map)
+            guidance_result = compute_best_parkings(dests, free_parkings, parking_distance_map, betas, sp)
+            
+            #print(guidance_result)
             
             for ar in guidance_result:
                 controlled_vehicles.add(ar["veh_id"])
@@ -155,8 +198,8 @@ if __name__ == "__main__":
                                                     vehicle_data[spv]["original_position"], 0,
                                                     parking_edge, 0, True)
             vehicle_data[spv]["parking_distance"] = parking_driving_distance
-            vehicle_data[spv]["original_price"] = starting_prices[vehicle_data[spv]["original_position"]]
-            vehicle_data[spv]["parking_price"] = starting_prices[parking_edge]
+            vehicle_data[spv]["original_price"] = sp[vehicle_data[spv]["original_position"]]
+            vehicle_data[spv]["parking_price"] = sp[parking_edge]
 
         active_vehicles = active_vehicles - set(stopping_vehicles)     
 
@@ -170,11 +213,9 @@ if __name__ == "__main__":
     occupancy_results["occupancy"] = p_occups
     
     try:
-        if not os.path.exists(f"../02_data/{args.name}"):
-            os.mkdir(f"../02_data/{args.name}")
-        os.replace(f"{SIM_ROOT}/{args.name}detector_data.out.xml",
+        os.replace(f"{SIM_ROOT}/{sim_name}detector_data.out.xml",
                    f"../02_data/{args.name}/detector_data.out.xml")
-        os.replace(f"./{args.name}vehicle_trips.xml",
+        os.replace(f"./{sim_name}vehicle_trips.xml",
                    f"../02_data/{args.name}/vehicle_trips.xml")
         
         with open(f"../02_data/{args.name}/veh_results.json", "w") as f:
