@@ -4,7 +4,7 @@ netgenerate --grid -o ../01_simulation/02_scenario/grid.net.xml --grid.number 6 
 
 python $SUMO_HOME/tools/randomTrips.py -n ../01_simulation/02_scenario/grid.net.xml -e 14400 --period 1.25 --weights-prefix probs -o ../01_simulation/02_scenario/trips.trips.xml
 
-python $SUMO_HOME/tools/generateParkingAreas.py -n ../01_simulation/02_scenario/grid.net.xml --space-length 6.7 --min 15 --max 15  --seed 42 --length 6.7 --output-file ../01_simulation/02_scenario/parking_areas.add.xml
+python $SUMO_HOME/tools/generateParkingAreas.py -n ../01_simulation/02_scenario/grid.net.xml --space-length 6.6 --min 15 --max 15  --seed 42 --length 6.6 --output-file ../01_simulation/02_scenario/parking_areas.add.xml
 
 $SUMO_HOME/tools/generateParkingAreaRerouters.py -n ../01_simulation/02_scenario/grid.net.xml -a ../01_simulation/02_scenario/parking_areas.add.xml -o ../01_simulation/02_scenario/parking_rerouters.add.xml --max-distance-alternatives 750
 
